@@ -14,9 +14,12 @@ class ProgressBarMonitor {
     private var workspaceObserver: NSObjectProtocol?
     private var detectedProgressBars: Set<String> = []
     private var debounceTimer: Timer?
+    private var pollingTimer: Timer?
 
     // Debounce interval to avoid duplicate detections
     private let debounceInterval: TimeInterval = 0.3
+    // Polling interval for active scanning (in seconds)
+    private let pollingInterval: TimeInterval = 1.0
 
     init() {
         print("🎵 ProgressBarMonitor initialized")
@@ -40,6 +43,9 @@ class ProgressBarMonitor {
 
         // Monitor currently running apps
         monitorRunningApplications()
+
+        // Start polling timer for active scanning
+        startPollingTimer()
     }
 
     /// Stop monitoring
@@ -63,6 +69,8 @@ class ProgressBarMonitor {
         monitoredApps.removeAll()
 
         debounceTimer?.invalidate()
+        pollingTimer?.invalidate()
+        pollingTimer = nil
     }
 
     // MARK: - Private Methods
@@ -147,8 +155,12 @@ class ProgressBarMonitor {
 
         guard error == .success,
               let roleString = role as? String else {
+            print("🔍 DEBUG: Failed to get role or no role string")
             return
         }
+
+        // DEBUG: Log all roles we see
+        print("🔍 DEBUG: UI Element Role: \(roleString)")
 
         // Check if it's a progress indicator
         if roleString == "AXProgressIndicator" || roleString == kAXProgressIndicatorRole as String {
@@ -208,6 +220,58 @@ class ProgressBarMonitor {
             }
         }
     }
+
+    // MARK: - Polling-based Detection
+
+    private func startPollingTimer() {
+        print("⏱️ Starting polling timer (checking every \(pollingInterval)s)")
+        pollingTimer = Timer.scheduledTimer(withTimeInterval: pollingInterval, repeats: true) { [weak self] _ in
+            self?.pollForProgressBars()
+        }
+    }
+
+    private func pollForProgressBars() {
+        // Get the frontmost application
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
+
+        let pid = frontApp.processIdentifier
+        let appElement = AXUIElementCreateApplication(pid)
+
+        // Search for progress indicators in the frontmost app
+        searchForProgressBars(in: appElement, appName: frontApp.localizedName ?? "Unknown", pid: pid)
+    }
+
+    private func searchForProgressBars(in element: AXUIElement, appName: String, pid: pid_t) {
+        // Get the role of this element
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+
+        if let roleString = role as? String {
+            // Check if this is a progress indicator
+            if roleString == "AXProgressIndicator" || roleString == kAXProgressIndicatorRole as String {
+                print("🔍 POLLING: Found progress indicator in \(appName)!")
+                handleProgressBarDetected(element: element, role: roleString)
+                return
+            }
+        }
+
+        // Recursively search children
+        var childrenRef: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef)
+
+        guard error == .success, let children = childrenRef as? [AXUIElement] else {
+            return
+        }
+
+        // Limit depth to avoid performance issues (only search first few levels)
+        if children.count > 100 {
+            return // Too many children, skip to avoid slowdown
+        }
+
+        for child in children {
+            searchForProgressBars(in: child, appName: appName, pid: pid)
+        }
+    }
 }
 
 // MARK: - Accessibility Observer Callback
@@ -221,6 +285,13 @@ private func axObserverCallback(
     guard let refcon = refcon else { return }
 
     let monitor = Unmanaged<ProgressBarMonitor>.fromOpaque(refcon).takeUnretainedValue()
+
+    // DEBUG: Log all notifications received
+    let notificationName = notification as String
+    var pid: pid_t = 0
+    AXUIElementGetPid(element, &pid)
+    let app = NSRunningApplication(processIdentifier: pid)
+    print("🔍 DEBUG: Notification '\(notificationName)' from \(app?.localizedName ?? "Unknown")")
 
     // Handle the notification on main thread
     DispatchQueue.main.async {
